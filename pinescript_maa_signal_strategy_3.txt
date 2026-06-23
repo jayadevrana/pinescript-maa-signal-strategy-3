@@ -1,0 +1,439 @@
+//@version=5
+strategy("MAA SIGNAL", overlay=true)
+
+ema = ta.ema(close,1000)
+
+low_timeframe1 = input.timeframe("3")
+low_timeframe2 = input.timeframe("5")
+high_timeframe1 = input.timeframe("30")
+high_timeframe2 = input.timeframe("60")
+
+plot(ema,color = color.rgb(255, 0, 204),linewidth = 2)
+
+// Common UI Settings (Shared between both instances)
+simple bool         showkalman           = input.bool(true, "Show Supertrend on chart?", group = "UI Settings")
+simple bool         paintCandles         = input.bool(true, "Paint candles according to Trend?", group = "UI Settings")
+simple bool         showlongshort        = input.bool(true, "Show Long and Short Signals {𝕃 + 𝕊}", group = "UI Settings")
+
+color longColor  = input.color(#33ff00, "Long Color", group = "UI Settings", inline = "Col")
+color shortColor = input.color(#ff0000, "Short Color", group = "UI Settings", inline = "Col")
+
+// First Instance Parameters
+series float        pricesource          = input.source(close, "MAA SIGNAL 1", group = "Calculation 1")
+simple float        measurementNoise     = input.float(3.0, title="Measurement Noise 1", group = "Calculation 1", tooltip = "Lookback Period/ Calculation Length", step = 1.0)
+simple float        processNoise         = input.float(0.01, title="Process Noise 1", step = 0.01, group = "Calculation 1")
+simple int          atrPeriod            = input.int(12, "ATR Period 1", group = "Supertrend 1", inline = "ST1")
+simple float        factor               = input.float(1.7, "Factor 1", group = "Supertrend 1", inline = "ST1", step = 0.01)
+
+// Second Instance Parameters
+series float        pricesource1         = input.source(close, "MAA SIGNAL 2", group = "Calculation 2")
+simple float        measurementNoise1    = input.float(5.0, title="Measurement Noise 2", group = "Calculation 2", step = 1.0)
+simple float        processNoise1        = input.float(0.05, title="Process Noise 2", step = 0.01, group = "Calculation 2")
+simple int          atrPeriod1           = input.int(20, "ATR Period 2", group = "Supertrend 2", inline = "ST2")
+simple float        factor1              = input.float(2.0, "Factor 2", group = "Supertrend 2", inline = "ST2", step = 0.01)
+
+/////////////////////////////////////////////////////////////// 
+// First Instance Functions
+N = 5
+var float[] stateEstimate = array.new_float(N, na)
+var float[] errorCovariance = array.new_float(N, 100.0)
+
+f_init(series float src) =>
+    if na(array.get(stateEstimate, 0))
+        for i = 0 to N-1
+            array.set(stateEstimate, i, src)
+            array.set(errorCovariance, i, 1.0)
+
+f_kalman(series float src, float noise) =>
+    predictedStateEstimate = array.new_float(N)
+    predictedErrorCovariance = array.new_float(N)
+    for i = 0 to N-1
+        array.set(predictedStateEstimate, i, array.get(stateEstimate, i))
+        array.set(predictedErrorCovariance, i, array.get(errorCovariance, i) + processNoise)
+    
+    kalmanGain = array.new_float(N)
+    for i = 0 to N-1
+        kg = array.get(predictedErrorCovariance, i) / (array.get(predictedErrorCovariance, i) + noise)
+        array.set(kalmanGain, i, kg)
+        array.set(stateEstimate, i, array.get(predictedStateEstimate, i) + kg * (src - array.get(predictedStateEstimate, i)))
+        array.set(errorCovariance, i, (1 - kg) * array.get(predictedErrorCovariance, i))
+    
+    array.get(stateEstimate, 0)
+
+KHMA(_src, _length) =>
+    f_kalman(2 * f_kalman(_src, _length / 2) - f_kalman(_src, _length), math.round(math.sqrt(_length)))
+
+///////////////////////////////////////////////////////////////
+// Second Instance Functions
+var float[] stateEstimate1 = array.new_float(N, na)
+var float[] errorCovariance1 = array.new_float(N, 100.0)
+
+f_init1(series float src) =>
+    if na(array.get(stateEstimate1, 0))
+        for i = 0 to N-1
+            array.set(stateEstimate1, i, src)
+            array.set(errorCovariance1, i, 1.0)
+
+f_kalman1(series float src, float noise) =>
+    predictedStateEstimate = array.new_float(N)
+    predictedErrorCovariance = array.new_float(N)
+    for i = 0 to N-1
+        array.set(predictedStateEstimate, i, array.get(stateEstimate1, i))
+        array.set(predictedErrorCovariance, i, array.get(errorCovariance1, i) + processNoise1)
+    
+    kalmanGain = array.new_float(N)
+    for i = 0 to N-1
+        kg = array.get(predictedErrorCovariance, i) / (array.get(predictedErrorCovariance, i) + noise)
+        array.set(kalmanGain, i, kg)
+        array.set(stateEstimate1, i, array.get(predictedStateEstimate, i) + kg * (src - array.get(predictedStateEstimate, i)))
+        array.set(errorCovariance1, i, (1 - kg) * array.get(predictedErrorCovariance, i))
+    
+    array.get(stateEstimate1, 0)
+
+KHMA1(_src, _length) =>
+    f_kalman1(2 * f_kalman1(_src, _length / 2) - f_kalman1(_src, _length), math.round(math.sqrt(_length)))
+
+///////////////////////////////////////////////////////////////
+// First Instance Calculations
+f_init(pricesource)
+kalmanFilteredPrice = f_kalman(pricesource, measurementNoise)
+kalmanHMA = KHMA(pricesource, measurementNoise)
+
+supertrend(factor, atrPeriod, src) =>
+    atr = ta.atr(atrPeriod)
+    upperBand = src + factor * atr
+    lowerBand = src - factor * atr
+    prevLowerBand = nz(lowerBand[1])
+    prevUpperBand = nz(upperBand[1])
+    lowerBand := lowerBand > prevLowerBand or close[1] < prevLowerBand ? lowerBand : prevLowerBand
+    upperBand := upperBand < prevUpperBand or close[1] > prevUpperBand ? upperBand : prevUpperBand
+    int direction = na
+    float superTrend = na
+    prevSuperTrend = superTrend[1]
+    if na(atr[1])
+        direction := 1
+    else if prevSuperTrend == prevUpperBand
+        direction := close > upperBand ? -1 : 1
+    else
+        direction := close < lowerBand ? 1 : -1
+    superTrend := direction == -1 ? lowerBand : upperBand
+    [superTrend, direction]
+
+[superTrend, direction] = supertrend(factor, atrPeriod, kalmanHMA)
+
+[superTrend_1, direction_1] = request.security(syminfo.tickerid, low_timeframe1, supertrend(factor, atrPeriod, kalmanHMA))
+[superTrend_2, direction_2] = request.security(syminfo.tickerid, low_timeframe2, supertrend(factor, atrPeriod, kalmanHMA))
+[superTrend_3, direction_3] = request.security(syminfo.tickerid, high_timeframe1, supertrend(factor, atrPeriod, kalmanHMA))
+[superTrend_4, direction_4] = request.security(syminfo.tickerid, high_timeframe2, supertrend(factor, atrPeriod, kalmanHMA))
+
+
+uptrend1 = direction_1 < 0
+uptrend2 = direction_2 < 0
+uptrend3 = direction_3 < 0
+uptrend4 = direction_4 < 0
+
+///////////////////////////////////////////////////////////////
+// Second Instance Calculations
+f_init1(pricesource1)
+kalmanFilteredPrice1 = f_kalman1(pricesource1, measurementNoise1)
+kalmanHMA1 = KHMA1(pricesource1, measurementNoise1)
+
+supertrend1(factor, atrPeriod, src) =>
+    atr = ta.atr(atrPeriod)
+    upperBand = src + factor * atr
+    lowerBand = src - factor * atr
+    prevLowerBand = nz(lowerBand[1])
+    prevUpperBand = nz(upperBand[1])
+    lowerBand := lowerBand > prevLowerBand or close[1] < prevLowerBand ? lowerBand : prevLowerBand
+    upperBand := upperBand < prevUpperBand or close[1] > prevUpperBand ? upperBand : prevUpperBand
+    int direction = na
+    float superTrend = na
+    prevSuperTrend = superTrend[1]
+    if na(atr[1])
+        direction := 1
+    else if prevSuperTrend == prevUpperBand
+        direction := close > upperBand ? -1 : 1
+    else
+        direction := close < lowerBand ? 1 : -1
+    superTrend := direction == -1 ? lowerBand : upperBand
+    [superTrend, direction]
+
+[superTrend1, direction1] = supertrend1(factor1, atrPeriod1, kalmanHMA1)
+
+[superTrend_11, direction_11] = request.security(syminfo.tickerid, low_timeframe1, supertrend1(factor1, atrPeriod1, kalmanHMA1))
+[superTrend_21, direction_21] = request.security(syminfo.tickerid, low_timeframe2, supertrend1(factor1, atrPeriod1, kalmanHMA1))
+[superTrend_31, direction_31] = request.security(syminfo.tickerid, high_timeframe1, supertrend(factor1, atrPeriod1, kalmanHMA1))
+[superTrend_41, direction_41] = request.security(syminfo.tickerid, high_timeframe2, supertrend(factor1, atrPeriod1, kalmanHMA1))
+
+
+uptrend11 = direction_11 < 0
+uptrend21 = direction_21 < 0
+uptrend31 = direction_31 < 0
+uptrend41 = direction_41 < 0
+
+
+
+// Create a table to display the signals.
+// The table will have 5 columns (the first as a row header) and 2 rows.
+// The table now includes a frame and border with neutral gray colors.
+var table sigTable = table.new(position.top_right, 7, 5, border_width = 2, border_color = color.gray, frame_width  = 2, frame_color  = color.gray)
+
+if close > 0
+    // Header row (row 0): first cell shows "Indicator"; then display the timeframe inputs.
+    table.cell(sigTable, 0, 0, text = "Indicator")
+    table.cell(sigTable, 1, 0, text = low_timeframe1)
+    table.cell(sigTable, 2, 0, text = low_timeframe2)
+    table.cell(sigTable, 3, 0, text = high_timeframe1)
+    table.cell(sigTable, 4, 0, text = high_timeframe2)
+    
+    // Data row (row 1): first cell label, then the Supertrend signals.
+    table.cell(sigTable, 0, 1, text = "MAA Signal 1")
+    table.cell(sigTable, 1, 1, text = uptrend1 ? "UP" : "DN", text_color = uptrend1 ? color.green : color.red)
+    table.cell(sigTable, 2, 1, text = uptrend2 ? "UP" : "DN", text_color = uptrend2 ? color.green : color.red)
+    table.cell(sigTable, 3, 1, text = uptrend3 ? "UP" : "DN", text_color = uptrend3 ? color.green : color.red)
+    table.cell(sigTable, 4, 1, text = uptrend4 ? "UP" : "DN", text_color = uptrend4 ? color.green : color.red)
+    table.cell(sigTable, 0, 2, text = "MAA Signal 2")
+    table.cell(sigTable, 1, 2, text = uptrend11 ? "UP" : "DN", text_color = uptrend11 ? color.green : color.red)
+    table.cell(sigTable, 2, 2, text = uptrend21 ? "UP" : "DN", text_color = uptrend21 ? color.green : color.red)
+    table.cell(sigTable, 3, 2, text = uptrend31 ? "UP" : "DN", text_color = uptrend31 ? color.green : color.red)
+    table.cell(sigTable, 4, 2, text = uptrend41 ? "UP" : "DN", text_color = uptrend41 ? color.green : color.red)
+
+
+///////////////////////////////////////////////////////////////
+// Combined Trend Logic
+var int Trend = 0
+var int Trend1 = 0
+var color barColour = #ffffff
+
+// First Instance Signals
+SupertrendLong = ta.crossunder(direction, 0)
+SupertrendShort = ta.crossover(direction, 0)
+
+
+buy = (direction < 0 and ta.crossunder(direction1,0)) or (direction1 < 0 and ta.crossunder(direction,0))
+sell = (direction > 0 and ta.crossover(direction1,0)) or (direction1 > 0 and ta.crossover(direction,0))
+
+buy1 = direction1 < 0 and ta.crossover(direction,0)
+sell1 = direction1 > 0 and ta.crossunder(direction,0)
+
+
+
+ 
+long_last1 = false
+short_last1 = false
+ 
+long_last1 := nz(long_last1[1])
+short_last1 := nz(short_last1[1])
+ 
+ 
+
+ 
+long1 = false
+long1 := nz(long1[1])
+ 
+short1 = false
+short1 := nz(short1[1])
+ 
+long_wait1 = false
+long_wait1 := nz(long_wait1[1])
+ 
+short_wait1 = false
+short_wait1 := nz(short_wait1[1])
+ 
+low_forming = sell1 //and not short_last1
+high_forming = buy1 //and not long_last1
+ 
+entry_p = 0.0
+entry_p := nz(entry_p[1])
+ 
+if(low_forming)
+    entry_p := low//-buffer
+    short_wait1 := true
+    long_wait1 := false
+ 
+if(high_forming)
+    entry_p := high//+buffer
+    long_wait1 := true
+    short_wait1 := false
+
+if strategy.position_size < 0
+    long_wait1 := false
+
+if strategy.position_size > 0
+    short_wait1 := false
+buye = long_wait1 and ta.crossover(close , entry_p)
+selle = short_wait1 and ta.crossunder(close , entry_p)
+
+long_new_trades = strategy.position_size[1] > 0 and (strategy.position_size > strategy.position_size[1])
+short_new_trades = strategy.position_size[1] < 0 and (strategy.position_size < strategy.position_size[1])
+
+l = false
+l := l[1]
+
+s = false 
+s := s[1]
+
+if long_new_trades
+    l := true
+    s := false
+
+if short_new_trades
+    s := true
+    l := false
+
+if ta.change(time("D")) 
+    l := false
+    s := false
+
+
+ 
+ 
+if(buye)
+    long1 := true
+    long_wait1 := false
+    short1 := false
+    long_last1 := true
+    short_last1 := false
+ 
+if(selle)
+    short1 := true
+    short_wait1 := false
+    long1 := false
+    long_last1 := false
+    short_last1 := true
+
+plot(long_wait1 ? entry_p : na , color = color.green , linewidth = 2 , style = plot.style_linebr)
+plot(short_wait1 ? entry_p : na , color = color.red , linewidth = 2 , style = plot.style_linebr)
+
+
+if strategy.position_size[1] < 0 and selle and not s
+    strategy.entry("FBR",strategy.short)
+
+
+if strategy.position_size[1] > 0 and buye and not l
+    strategy.entry("FSR",strategy.long)
+
+// Second Instance Signals
+SupertrendLong1 = ta.crossunder(direction1, 0)
+SupertrendShort1 = ta.crossover(direction1, 0)
+
+// Update Trends
+if SupertrendLong and not SupertrendShort
+    Trend := 1
+if SupertrendShort
+    Trend := -1
+
+if SupertrendLong1 and not SupertrendShort1
+    Trend1 := 1
+if SupertrendShort1
+    Trend1 := -1
+
+// Combined Coloring
+barColour := Trend == 1 ? longColor : Trend == -1 ? shortColor : Trend1 == 1 ? longColor : Trend1 == -1 ? shortColor : barColour
+
+///////////////////////////////////////////////////////////////
+// Plotting
+plot(showkalman ? superTrend : na, "MAA SIGNAL 1", color=direction < 0 ? color.new(#00FF00, 40) : color.red, linewidth=2)
+plot(showkalman ? superTrend1 : na, "MAA SIGNAL 2", color=direction1 < 0 ? color.new(#00FF00, 40) : color.red, linewidth=2)
+
+barcolor(paintCandles ? barColour : na)
+
+// Plot Signals
+plotshape(showlongshort ? SupertrendLong : na, "Long 1", shape.triangleup, location.belowbar, color=#00FF00, size=size.small)
+plotshape(showlongshort ? SupertrendShort : na, "Short 1", shape.triangledown, location.abovebar, color=#FF0000, size=size.small)
+plotshape(showlongshort ? SupertrendLong1 : na, "Long 2", shape.flag, location.belowbar, color=#00FF00, size=size.small)
+plotshape(showlongshort ? SupertrendShort1 : na, "Short 2", shape.flag, location.abovebar, color=#FF0000, size=size.small)
+
+buffer = input(0.1,"Buffer %")/100
+
+use_tgt1 = input(true,"",inline = "tgt1")
+tgt1 = input(1.0,inline = "tgt1") 
+
+if not use_tgt1
+    tgt1 := 100000
+
+
+use_tgt2 = input(true,"",inline = "tgt2")
+tgt2 = input(2.0,inline = "tgt2")
+
+if not use_tgt2
+    tgt2 := 100000
+
+
+use_tgt3 = input(true,"",inline = "tgt3")
+tgt3 = input(3.0,inline = "tgt3")
+
+if not use_tgt3
+    tgt3 := 100000
+
+
+use_sl = input(true,"",inline = "sl")
+sl = input(3.0,inline = "sl")
+
+if not use_sl
+    sl := 100000
+
+
+
+buy_alert =''
+sell_alert = ''
+
+
+//{"type": "buy","symbol": "BTCUSDm","volume": 0.2,"sl":10000,"tp":10000,"closeprevious":true,"price":"{{close}}"}
+
+
+exit_alert = ''
+
+reduce_buy = ''
+reduce_sell = ''
+
+
+reentry_buy = (low < superTrend and close > superTrend) and strategy.position_size > 0
+reentry_sell = (high > superTrend and close < superTrend) and strategy.position_size < 0
+
+if reentry_buy and  not (reentry_buy[1] or l or buy)
+    strategy.entry("buy Re-entry",strategy.long)
+
+if reentry_sell and not (s or  reentry_sell[1] or sell)
+    strategy.entry("sell Re-entry",strategy.short)
+
+if buy and strategy.position_size[1] < 1
+    strategy.entry('Buy', strategy.long,qty = 3, stop = high*(1+buffer))
+
+if (direction > 0) or (direction1 > 0)
+    strategy.cancel('Buy')
+
+longprice = ta.valuewhen((buy and strategy.position_size < 1),(high*(1+buffer)),0)
+shortprice = ta.valuewhen((sell and strategy.position_size > -1),(low*(1-buffer)),0)
+
+
+if strategy.position_size > 0
+    strategy.exit("T1","Buy",qty = 1,limit = longprice *(1+ tgt1/100),stop = longprice*(1 - sl/100),comment_loss = "sl",alert_message = reduce_buy,alert_loss = exit_alert)
+    strategy.exit("T2","Buy",qty = 1,limit = longprice *(1+ tgt2/100),stop = longprice *(1 - sl/100),comment_loss = "sl",alert_message = reduce_buy,alert_loss = exit_alert)
+    strategy.exit("T3","Buy",qty = 1,limit = longprice *(1+ tgt3/100),stop = longprice*(1 - sl/100),comment_loss = "sl",alert_message = reduce_buy,alert_loss = exit_alert)
+
+plot(strategy.position_size > 0 and use_tgt1 == true ? longprice *(1+ tgt1/100) : na,style = plot.style_linebr)
+plot(strategy.position_size > 0 and use_tgt2 == true ? longprice *(1+ tgt2/100) : na,style = plot.style_linebr)
+plot(strategy.position_size > 0 and use_tgt3 == true? longprice *(1+ tgt3/100) : na,style = plot.style_linebr)
+plot(strategy.position_size > 0 and use_sl == true? longprice *(1- sl/100) : na,style = plot.style_linebr,color = color.red)
+
+
+
+if sell and strategy.position_size[1] > -1
+    strategy.entry('Sell', strategy.short,qty = 3,stop = low*(1-buffer))
+
+
+if (direction < 0) or (direction1 < 0)
+    strategy.cancel('Sell')
+
+
+if strategy.position_size < 0
+    strategy.exit("T1","Sell",qty = 1,limit = shortprice *(1 - tgt1/100),stop = shortprice *(1 + sl/100),comment_loss = "sl",alert_message = reduce_sell,alert_loss = exit_alert)
+    strategy.exit("T2","Sell",qty = 1,limit = shortprice *(1 - tgt2/100),stop = shortprice *(1 + sl/100),comment_loss = "sl",alert_message = reduce_sell,alert_loss = exit_alert)
+    strategy.exit("T3","Sell",qty = 1,limit = shortprice *(1 - tgt3/100),stop = shortprice *(1 + sl/100),comment_loss = "sl",alert_message = reduce_sell,alert_loss = exit_alert)
+
+plot(strategy.position_size < 0  and use_tgt1 == true ? shortprice *(1- tgt1/100) : na,style = plot.style_linebr)
+plot(strategy.position_size < 0  and use_tgt2 == true ? shortprice *(1- tgt2/100) : na,style = plot.style_linebr)
+plot(strategy.position_size < 0  and use_tgt3 == true ? shortprice *(1- tgt3/100) : na,style = plot.style_linebr)
+plot(strategy.position_size < 0 and use_sl == true ? shortprice *(1+ sl/100) : na,style = plot.style_linebr,color = color.red)
+
